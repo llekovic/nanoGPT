@@ -1,4 +1,7 @@
+
 """
+Credit: https://github.com/karpathy/nanoGPT
+
 Full definition of a GPT Language Model, all of it in this single file.
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
@@ -6,6 +9,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
+import custom_attention
 
 import math
 import inspect
@@ -14,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -25,6 +30,10 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+import gpytorch
+
+kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
 
 class CausalSelfAttention(nn.Module):
 
@@ -42,8 +51,14 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
+        self.flash = False #hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.custom_attention = True
+        if self.custom_attention:
+            print("WARNING: Using custom attention")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+        elif not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -59,9 +74,15 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if self.custom_attention:
+            kernel = custom_attention.kernel_attention_k(q, k, bias = self.bias) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+            kernel = self.attn_dropout(kernel)
+            y = kernel @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -69,6 +90,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
