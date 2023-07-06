@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from gpytorch.kernels import RBFKernel
 
 
 class LayerNorm(nn.Module):
@@ -31,17 +32,31 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-import gpytorch
-
-kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
 
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        
+        self.custom_attention= 'k'  #   set to 'k' or 'qk' if using Kernel(K) or Kernel(Q,K)
+        
+        self.kernel = RBFKernel()
+
+        if self.custom_attention:
+            if self.custom_attention= 'k':
+                print("WARNING: Using Kernel(K) attention")
+                # only key, value projections for all heads, but in a batch
+                self.c_attn = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+            elif self.custom_attention= 'qk':
+                print("WARNING: Using Kernel(Q,K) attention")
+                # key, query, value projections for all heads, but in a batch
+                self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+
+        else:
+            # key, query, value projections for all heads, but in a batch
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -51,13 +66,12 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = False #hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        self.custom_attention = True
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if self.custom_attention:
             print("WARNING: Using custom attention")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            self.register_buffer("bias", (torch.tril(torch.ones(config.block_size, config.block_size)) < 0.5).view(1, 1, config.block_size, config.block_size))
+
         elif not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -67,23 +81,47 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.custom_attention:
-            kernel = custom_attention.kernel_attention_k(q, k, bias = self.bias) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-            kernel = self.attn_dropout(kernel)
-            y = kernel @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        
+            if self.custom_attention= 'k':
+                # !!! This only calculates keys & values.
+                # calculate keys, values for all heads in batch and move head forward to be the batch dim
+                k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+                k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+                kern = custom_attention.kernel_attention_k(k, bias=self.bias, kernel=self.kernel) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+                kern = self.attn_dropout(kern)
+                y = kern @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+            if self.custom_attention= 'qk':
+                # calculate query, key, & values for all heads in batch and move head forward to be the batch dim
+                q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+                k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+                kern = custom_attention.kernel_attention_qk(q, k, bias=self.bias, kernel=self.kernel) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+                kern = self.attn_dropout(kern)
+                y = kern @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
         elif self.flash:
+            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         
         else:
+            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
@@ -282,6 +320,9 @@ class GPT(nn.Module):
 
         return model
 
+    def is_kernel_hyper(self, param_name):
+        return 'raw_lengthscale' in param_name
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -289,8 +330,9 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2 and not self.is_kernel_hyper(n)]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2 or self.is_kernel_hyper(n)]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}

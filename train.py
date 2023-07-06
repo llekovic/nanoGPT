@@ -14,6 +14,22 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 - Run on the worker node:
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+
+To run on 2 gpus:
+CUDA_VISIBLE_DEVICES= torchrun --rdzv-backend=c10d --rdzv-endpoint=locust04.seas.upenn.edu:40000  --nproc-per-node=2 train.py
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nproc-per-node=4 train.py
+
+
+(& use --rdzv-backend=c10d  if needed)
+
+CUDA_VISIBLE_DEVICES=3 python train.py
+
+python -m cProfile -o rbf_qk.prof train.py
+https://jiffyclub.github.io/snakeviz/
+Then --> snakeviz rbf_qk.prof
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 CUDA_LAUNCH_BLOCKING=1 torchrun --standalone --nproc-per-node=4 -m cProfile -o rbf_k-tril.prof train.py
+
 """
 
 import os
@@ -33,18 +49,18 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
+eval_interval = 1000
+log_interval = 10
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
-wandb_project = 'wikitext'
-wandb_run_name = 'RBF (K,Q) Attention' # 'run' + str(time.time())
+wandb_project = 'openwebtext'
+wandb_run_name = 'RBF-QK-2' # 'run' + str(time.time())
 # data
-dataset = 'wikitext'
+dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -56,7 +72,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 10_000 # total number of training iterations
+max_iters = 600_000 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -64,7 +80,7 @@ grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 10_000 # should be ~= max_iters per Chinchilla
+lr_decay_iters = 600_000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -268,6 +284,7 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -280,7 +297,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt-' + str(wandb_run_name) + '.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -322,6 +339,14 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "loss": lossf,
+            })
+
+
+
     iter_num += 1
     local_iter_num += 1
 
