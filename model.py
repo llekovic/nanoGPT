@@ -44,11 +44,11 @@ class CausalSelfAttention(nn.Module):
         self.kernel = RBFKernel()
 
         if self.custom_attention:
-            if self.custom_attention= 'k':
+            if self.custom_attention == 'k':
                 print("WARNING: Using Kernel(K) attention")
                 # only key, value projections for all heads, but in a batch
                 self.c_attn = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
-            elif self.custom_attention= 'qk':
+            elif self.custom_attention == 'qk':
                 print("WARNING: Using Kernel(Q,K) attention")
                 # key, query, value projections for all heads, but in a batch
                 self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -83,7 +83,7 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.custom_attention:
-            if self.custom_attention= 'k':
+            if self.custom_attention == 'k':
                 # !!! This only calculates keys & values.
                 # calculate keys, values for all heads in batch and move head forward to be the batch dim
                 k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -94,7 +94,7 @@ class CausalSelfAttention(nn.Module):
                 kern = self.attn_dropout(kern)
                 y = kern @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
-            if self.custom_attention= 'qk':
+            if self.custom_attention == 'qk':
                 # calculate query, key, & values for all heads in batch and move head forward to be the batch dim
                 q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
                 k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
