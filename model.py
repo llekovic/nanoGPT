@@ -35,11 +35,12 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, profiler):
         super().__init__()
+        self.profiler = profiler
         assert config.n_embd % config.n_head == 0
         
-        self.custom_attention= 'k'  #   set to 'k' or 'qk' if using Kernel(K) or Kernel(Q,K)
+        self.custom_attention= 'qk'  #   set to 'k' or 'qk' if using Kernel(K) or Kernel(Q,K)
         
         self.kernel = RBFKernel()
 
@@ -84,50 +85,54 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.custom_attention:
             if self.custom_attention == 'k':
-                # !!! This only calculates keys & values.
-                # calculate keys, values for all heads in batch and move head forward to be the batch dim
-                k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-                k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-                v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                with self.profiler('kernel_attention_k'):
+                    # !!! This only calculates keys & values.
+                    # calculate keys, values for all heads in batch and move head forward to be the batch dim
+                    k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+                    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                    v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-                kern = custom_attention.kernel_attention_k(k, bias=self.bias, kernel=self.kernel) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-                kern = self.attn_dropout(kern)
-                y = kern @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+                    kern = custom_attention.kernel_attention_k(k, bias=self.bias, kernel=self.kernel, profiler=self.profiler) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+                    kern = self.attn_dropout(kern)
+                    y = kern @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
             if self.custom_attention == 'qk':
-                # calculate query, key, & values for all heads in batch and move head forward to be the batch dim
+                with self.profiler('kernel_attention_qk'):
+                    # calculate query, key, & values for all heads in batch and move head forward to be the batch dim
+                    q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+                    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                    v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+                    kern = custom_attention.kernel_attention_qk(q, k, bias=self.bias, kernel=self.kernel, profiler=self.profiler) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+                    kern = self.attn_dropout(kern)
+                    y = kern @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        elif self.flash:
+            with self.profiler('flash_attention'):
+                # calculate query, key, values for all heads in batch and move head forward to be the batch dim
                 q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
                 k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
                 q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
                 v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-                kern = custom_attention.kernel_attention_qk(q, k, bias=self.bias, kernel=self.kernel) # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-                kern = self.attn_dropout(kern)
-                y = kern @ v      # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
-        elif self.flash:
-            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                # efficient attention using Flash Attention CUDA kernels
+                y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         
         else:
-            # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-            q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            with self.profiler('slow_attention'):
+                # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+                q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+                k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+                
+                # manual implementation of attention
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
@@ -153,10 +158,11 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, profiler):
         super().__init__()
+        self.profiler = profiler
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, profiler)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -177,17 +183,18 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, profiler):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.profiler = profiler
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, profiler) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)

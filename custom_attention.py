@@ -21,7 +21,7 @@ This would be better because I could make <dropout=self.dropout if self.training
 
 NOTE: Should be able to use "with settings.lazily_evaluate_kernels(False):", but I can't get it to work (instead I am just using .evaluate())
 """
-def k_attention(q, k, bias):
+def k_attention(q, k, bias, profiler):
     # Implementation of k @ k attention
     _, _, T, _ = k.size()
     att = (k @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -30,7 +30,7 @@ def k_attention(q, k, bias):
     return y
 
 #working kernel(K) attention
-def kernel_attention_k(k, bias, kernel):
+def kernel_attention_k(k, bias, kernel, profiler):
     _, _, T, hs = k.size()
     k = k / math.sqrt(k.size(-1))
     # Compute RBF kernel to get attention scores
@@ -39,14 +39,18 @@ def kernel_attention_k(k, bias, kernel):
     y = scores / (scores.sum(dim=-1, keepdim=True) + 1e-4)    # Normalize the attention scores to probabilities (no softmax)
     return y
 
-def kernel_attention_qk(q, k, bias, kernel):
-    _, _, T, _ = k.size() 
-    q = q / math.sqrt(k.size(-1))
-    k = k / math.sqrt(k.size(-1))
+def kernel_attention_qk(q, k, bias, kernel, profiler):
+    with profiler("divide by sqrt k.size(-1)"):
+        _, _, T, hs = k.size()
+        q = q / math.sqrt(k.size(-1))
+        k = k / math.sqrt(k.size(-1))
     # Compute kernel to get attention scores
-    scores = kernel(q,k).evaluate()        #  (B x num heads x T x T)
-    scores = scores.masked_fill(bias[:,:,:T,:T], float('0'))
-    y = scores / (scores.sum(dim=-1, keepdim=True) + 1e-4)   # Normalize the attention scores to probabilities (no softmax)
+    with profiler("kernel calculation"):
+        scores = kernel(q,k).evaluate()        #  (B x num heads x T x T)
+    with profiler("masking"):
+        scores = scores.masked_fill(bias[:,:,:T,:T], float('0'))
+    with profiler("normalizing"):
+        y = scores / (scores.sum(dim=-1, keepdim=True) + 1e-4)   # Normalize the attention scores to probabilities (no softmax)
     return y
 
 
